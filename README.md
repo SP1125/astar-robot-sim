@@ -2,7 +2,7 @@
 
 A 2D robot navigation simulator in Python (pygame + NumPy). A differential-heading robot plans and follows a path to a goal while **moving obstacles** drift around the map, replanning as the environment changes.
 
-[demo](docs/final-robot-replanning.gif)
+[demo](final-robot-replanning.gif)
 
 ## What it does
 
