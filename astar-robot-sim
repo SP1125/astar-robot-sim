@@ -1,0 +1,579 @@
+"""2D robot navigation simulator: A* planning with dynamic replanning.
+
+Pipeline (see README for details):
+    occupancy grid (inflated by robot radius, obstacles swept forward in time)
+    -> A* (8-connected, octile heuristic, no corner cutting)
+    -> line-of-sight pruning -> Catmull-Rom smoothing
+    -> heading controller that follows the path
+    -> reactive repulsion layer as an emergency fallback near obstacles
+
+Run:  python astar_robot_sim.py [--runs N] [--seed S] [--headless]
+"""
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import random
+import heapq
+from dataclasses import dataclass
+
+import numpy as np
+import pygame as pg
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+WIDTH, HEIGHT = 800, 600
+FPS = 60
+CELL = 20                        # occupancy grid resolution (px)
+
+ROBOT_RADIUS = 20
+ROBOT_SPEED = 2.0                # px / frame
+TURN_RATE_PATH = 5.0             # deg / frame while path following
+TURN_RATE_AVOID = 8.0            # deg / frame while avoiding
+HEADING_TOLERANCE = 10.0         # only drive forward when this closely aligned (deg)
+MANUAL_TURN_RATE = 5.0
+
+AVOID_RANGE = 6.0                # edge-to-edge distance (px) that triggers reactive avoidance
+LOS_MARGIN = 6.0                 # extra clearance demanded when pruning the path (px)
+LOS_STEP = 6                     # sampling step for line-of-sight checks (px)
+SMOOTH_SAMPLES = 8               # Catmull-Rom samples per segment
+
+REPLAN_INTERVAL = 30             # frames between periodic replans
+REPLAN_MIN_GAP = 10              # minimum frames between event-triggered replans
+PREDICT_FRAMES = 15              # obstacles are planned around where they will be, not just where they are
+
+OBSTACLE_SPEED_RANGE = (0.8, 1.8)
+OBSTACLE_SPECS = [(10, 100), (100, 10), (100, 10)]   # (width, height) per obstacle
+MIN_START_GOAL_DIST = 250
+MAX_FRAMES_PER_RUN = FPS * 40    # a run that takes longer than this counts as a failure
+
+Point = tuple[float, float]
+Cell = tuple[int, int]
+
+
+# --------------------------------------------------------------------------
+# Geometry helpers
+# --------------------------------------------------------------------------
+def wrap_angle(deg: float) -> float:
+    """Wrap an angle in degrees to [-180, 180]."""
+    return (deg + 180.0) % 360.0 - 180.0
+
+
+def closest_point_on_rect(px: float, py: float, rect: pg.Rect) -> Point:
+    return max(rect.left, min(px, rect.right)), max(rect.top, min(py, rect.bottom))
+
+
+def circle_rect_collision(cx: float, cy: float, radius: float, rect: pg.Rect) -> bool:
+    qx, qy = closest_point_on_rect(cx, cy, rect)
+    return (cx - qx) ** 2 + (cy - qy) ** 2 <= radius * radius
+
+
+# --------------------------------------------------------------------------
+# Entities
+# --------------------------------------------------------------------------
+class Robot:
+    """Differential-heading robot that follows a list of waypoints."""
+
+    def __init__(self, x: float, y: float):
+        self.x = float(x)
+        self.y = float(y)
+        self.angle = 0.0                      # degrees, screen coords (y down => clockwise)
+        self.speed = ROBOT_SPEED
+        self.radius = ROBOT_RADIUS
+        self.path: list[Point] = []
+        self.path_idx = 0
+
+    def move(self, direction: float = 1.0) -> None:
+        """Move along the current heading (direction=-1 reverses)."""
+        rad = math.radians(self.angle)
+        self.x += direction * self.speed * math.cos(rad)
+        self.y += direction * self.speed * math.sin(rad)
+
+    def rotate(self, delta: float) -> None:
+        self.angle = (self.angle + delta) % 360.0
+
+    def turn_towards(self, desired_angle: float, max_rate: float) -> float:
+        """Rotate toward desired_angle by at most max_rate. Returns the remaining heading error."""
+        diff = wrap_angle(desired_angle - self.angle)
+        self.rotate(max(-max_rate, min(max_rate, diff)))
+        return wrap_angle(desired_angle - self.angle)
+
+    def follow_path_step(self) -> None:
+        """Turn toward the current waypoint, drive when roughly aligned, advance on arrival."""
+        if self.path_idx >= len(self.path):
+            return
+        tx, ty = self.path[self.path_idx]
+        dx, dy = tx - self.x, ty - self.y
+        if math.hypot(dx, dy) <= self.speed:
+            self.x, self.y = tx, ty
+            self.path_idx += 1
+            return
+        error = self.turn_towards(math.degrees(math.atan2(dy, dx)), TURN_RATE_PATH)
+        if abs(error) < HEADING_TOLERANCE:
+            self.move()
+
+    def avoid_step(self, rects: list[pg.Rect]) -> bool:
+        """Reactive fallback: steer away from obstacles that are dangerously close.
+
+        Uses edge-to-edge distance to every obstacle, sums repulsion vectors weighted by
+        proximity, turns toward the result and drives if roughly facing it.
+        Returns True if it acted (so the caller should skip path following this frame).
+        """
+        vx = vy = 0.0
+        for rect in rects:
+            qx, qy = closest_point_on_rect(self.x, self.y, rect)
+            dx, dy = self.x - qx, self.y - qy
+            dist = math.hypot(dx, dy)
+            clearance = dist - self.radius
+            if clearance >= AVOID_RANGE:
+                continue
+            if dist < 1e-6:                       # centre is inside the rect: push from its centre
+                dx, dy = self.x - rect.centerx, self.y - rect.centery
+                dist = math.hypot(dx, dy) or 1.0
+            weight = (AVOID_RANGE - max(clearance, 0.0)) / AVOID_RANGE
+            vx += dx / dist * weight
+            vy += dy / dist * weight
+        if vx == 0.0 and vy == 0.0:
+            return False
+        error = self.turn_towards(math.degrees(math.atan2(vy, vx)), TURN_RATE_AVOID)
+        if abs(error) < 60.0:
+            self.move()
+        return True
+
+    def draw(self, surface: pg.Surface) -> None:
+        centre = (int(self.x), int(self.y))
+        pg.draw.circle(surface, (255, 0, 0), centre, self.radius)
+        rad = math.radians(self.angle)
+        tip = (int(self.x + self.radius * math.cos(rad)), int(self.y + self.radius * math.sin(rad)))
+        pg.draw.line(surface, (0, 255, 0), centre, tip, 3)
+
+
+class Target:
+    radius = 10
+
+    def __init__(self, x: float, y: float):
+        self.x = float(x)
+        self.y = float(y)
+
+    def draw(self, surface: pg.Surface) -> None:
+        pg.draw.circle(surface, (0, 0, 255), (int(self.x), int(self.y)), self.radius)
+
+
+class Obstacle:
+    """Axis-aligned rectangle moving at constant velocity, bouncing off the screen edges."""
+
+    def __init__(self, x: float, y: float, width: int, height: int,
+                 bounds: tuple[int, int], rng: random.Random):
+        self.x = float(x)
+        self.y = float(y)
+        self.rect = pg.Rect(round(x), round(y), width, height)
+        self.bounds = bounds
+        speed = rng.uniform(*OBSTACLE_SPEED_RANGE)
+        heading = rng.uniform(0.0, 2.0 * math.pi)
+        self.vx = speed * math.cos(heading)
+        self.vy = speed * math.sin(heading)
+
+    def move(self) -> None:
+        self.x += self.vx
+        self.y += self.vy
+        max_x = self.bounds[0] - self.rect.width
+        max_y = self.bounds[1] - self.rect.height
+        if self.x < 0:
+            self.x, self.vx = 0.0, abs(self.vx)
+        elif self.x > max_x:
+            self.x, self.vx = float(max_x), -abs(self.vx)
+        if self.y < 0:
+            self.y, self.vy = 0.0, abs(self.vy)
+        elif self.y > max_y:
+            self.y, self.vy = float(max_y), -abs(self.vy)
+        self.rect.topleft = (round(self.x), round(self.y))
+
+    def predicted_rect(self, frames: int) -> pg.Rect:
+        """Bounding box of where the obstacle is now and where it will be in `frames` frames."""
+        future = self.rect.move(round(self.vx * frames), round(self.vy * frames))
+        future.clamp_ip(pg.Rect(0, 0, *self.bounds))
+        return self.rect.union(future)
+
+    def draw(self, surface: pg.Surface) -> None:
+        pg.draw.rect(surface, (0, 0, 0), self.rect)
+        pg.draw.circle(surface, (255, 0, 255), self.rect.center, 2)
+
+
+# --------------------------------------------------------------------------
+# Planning
+# --------------------------------------------------------------------------
+def build_occupancy(rects: list[pg.Rect], width: int, height: int,
+                    cell: int, pad: float) -> np.ndarray:
+    """Boolean grid (rows, cols); True where a cell overlaps any rect inflated by `pad`.
+
+    Vectorised: each rect marks a slice of the grid, so cost is O(#rects), not O(#cells * #rects).
+    """
+    cols = math.ceil(width / cell)
+    rows = math.ceil(height / cell)
+    occ = np.zeros((rows, cols), dtype=bool)
+    for rect in rects:
+        c0 = max(0, math.floor((rect.left - pad) / cell))
+        c1 = min(cols, math.ceil((rect.right + pad) / cell))
+        r0 = max(0, math.floor((rect.top - pad) / cell))
+        r1 = min(rows, math.ceil((rect.bottom + pad) / cell))
+        if c0 < c1 and r0 < r1:
+            occ[r0:r1, c0:c1] = True
+    return occ
+
+
+_SQRT2 = math.sqrt(2.0)
+_STEPS = [(dr, dc, math.hypot(dr, dc))
+          for dr in (-1, 0, 1) for dc in (-1, 0, 1) if (dr, dc) != (0, 0)]
+
+
+def _octile(a: Cell, b: Cell) -> float:
+    dr, dc = abs(a[0] - b[0]), abs(a[1] - b[1])
+    return (dr + dc) + (_SQRT2 - 2.0) * min(dr, dc)
+
+
+def _to_cell(p: Point, cell: int, rows: int, cols: int) -> Cell:
+    return (min(rows - 1, max(0, int(p[1] // cell))),
+            min(cols - 1, max(0, int(p[0] // cell))))
+
+
+def _to_world(node: Cell, cell: int) -> Point:
+    return node[1] * cell + cell / 2, node[0] * cell + cell / 2
+
+
+def astar(start: Point, goal: Point, occ: np.ndarray, cell: int) -> list[Point]:
+    """8-connected A* on the occupancy grid. Returns cell-centre waypoints, or [] if no path.
+
+    Diagonal moves are not allowed to cut the corner of an occupied cell.
+    The start cell may be occupied (e.g. an obstacle drifted onto the robot); the goal may not.
+    """
+    rows, cols = occ.shape
+    start_node = _to_cell(start, cell, rows, cols)
+    goal_node = _to_cell(goal, cell, rows, cols)
+    if occ[goal_node]:
+        return []
+
+    open_heap: list[tuple[float, float, Cell]] = [(_octile(start_node, goal_node), 0.0, start_node)]
+    came_from: dict[Cell, Cell] = {}
+    g_score: dict[Cell, float] = {start_node: 0.0}
+
+    while open_heap:
+        _, g, current = heapq.heappop(open_heap)
+        if g > g_score.get(current, math.inf):
+            continue                                   # stale heap entry
+        if current == goal_node:
+            nodes = [current]
+            while nodes[-1] in came_from:
+                nodes.append(came_from[nodes[-1]])
+            nodes.reverse()
+            return [_to_world(n, cell) for n in nodes]
+        r, c = current
+        for dr, dc, step_cost in _STEPS:
+            nr, nc = r + dr, c + dc
+            if not (0 <= nr < rows and 0 <= nc < cols) or occ[nr, nc]:
+                continue
+            if dr and dc and (occ[r + dr, c] or occ[r, c + dc]):
+                continue                               # no corner cutting
+            neighbour = (nr, nc)
+            tentative = g + step_cost
+            if tentative < g_score.get(neighbour, math.inf):
+                g_score[neighbour] = tentative
+                came_from[neighbour] = current
+                heapq.heappush(open_heap, (tentative + _octile(neighbour, goal_node), tentative, neighbour))
+    return []
+
+
+def line_of_sight(a: Point, b: Point, rects: list[pg.Rect], radius: float,
+                  step: float = LOS_STEP) -> bool:
+    """True if a disc of `radius` can slide from a to b without touching any rect."""
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    dist = math.hypot(dx, dy)
+    if dist == 0:
+        return True
+    steps = max(1, int(dist / step))
+    for i in range(1, steps + 1):
+        t = i / steps
+        x, y = a[0] + dx * t, a[1] + dy * t
+        if any(circle_rect_collision(x, y, radius, rect) for rect in rects):
+            return False
+    return True
+
+
+def prune_path(path: list[Point], rects: list[pg.Rect], radius: float) -> list[Point]:
+    """Greedy string-pulling: from each kept point, jump to the furthest visible point."""
+    if len(path) < 3:
+        return path[:]
+    pruned = [path[0]]
+    i = 0
+    while i < len(path) - 1:
+        for j in range(len(path) - 1, i, -1):
+            if line_of_sight(path[i], path[j], rects, radius):
+                pruned.append(path[j])
+                i = j
+                break
+        else:                                          # nothing visible: take one grid step
+            pruned.append(path[i + 1])
+            i += 1
+    return pruned
+
+
+def catmull_rom_chain(points: list[Point], samples_per_segment: int = SMOOTH_SAMPLES) -> list[Point]:
+    """Interpolate a smooth curve through the points (Catmull-Rom spline)."""
+    if len(points) < 2:
+        return points[:]
+
+    def blend(a: float, b: float, c: float, d: float, t: float) -> float:
+        return 0.5 * ((2 * b) + (-a + c) * t
+                      + (2 * a - 5 * b + 4 * c - d) * t * t
+                      + (-a + 3 * b - 3 * c + d) * t ** 3)
+
+    result: list[Point] = []
+    for i in range(len(points) - 1):
+        p0 = points[max(i - 1, 0)]
+        p1, p2 = points[i], points[i + 1]
+        p3 = points[min(i + 2, len(points) - 1)]
+        for s in range(samples_per_segment):
+            t = s / samples_per_segment
+            result.append((blend(p0[0], p1[0], p2[0], p3[0], t),
+                           blend(p0[1], p1[1], p2[1], p3[1], t)))
+    result.append(points[-1])
+    return result
+
+
+def plan_path(start: Point, goal: Point, rects: list[pg.Rect], radius: float,
+              width: int = WIDTH, height: int = HEIGHT, cell: int = CELL) -> list[Point]:
+    """Full planning pipeline. Returns a smooth waypoint list starting at `start`, or [] on failure."""
+    occ = build_occupancy(rects, width, height, cell, radius)
+    grid_path = astar(start, goal, occ, cell)
+    if not grid_path:
+        return []
+    # Anchor the path to the true start/goal rather than their cell centres.
+    waypoints = [start, *grid_path[1:-1], goal]
+    pruned = prune_path(waypoints, rects, radius + LOS_MARGIN)
+    smooth = catmull_rom_chain(pruned)
+    # A spline can bulge into an obstacle at a sharp corner; fall back to the (checked) polyline.
+    if any(circle_rect_collision(x, y, radius, rect) for x, y in smooth for rect in rects):
+        return pruned
+    return smooth
+
+
+# --------------------------------------------------------------------------
+# Simulation
+# --------------------------------------------------------------------------
+@dataclass
+class RunStats:
+    frames: int = 0
+    replans: int = 0
+    contact_frames: int = 0      # frames in which the robot had to be pushed out of an obstacle
+    reached: bool = False
+
+
+class Simulation:
+    def __init__(self, runs: int, seed: int | None, headless: bool):
+        self.max_runs = runs
+        self.headless = headless
+        self.rng = random.Random(seed)
+        self.screen = pg.display.set_mode((WIDTH, HEIGHT))
+        pg.display.set_caption("Robot Simulation with A*")
+        self.clock = pg.time.Clock()
+        self.font = pg.font.Font(None, 22)
+        self.history: list[RunStats] = []
+        self.running = True
+        self.autopilot = True
+        self.show_debug = False
+        self.new_scenario()
+
+    # ---- scenario setup -------------------------------------------------
+    def new_scenario(self) -> None:
+        """Random start/goal and obstacles; the first obstacle is placed between start and goal."""
+        rng = self.rng
+        self.robot = Robot(rng.randint(50, 150), rng.randint(50, 150))
+        while True:
+            tx, ty = rng.randint(50, WIDTH - 50), rng.randint(50, HEIGHT - 50)
+            if math.hypot(tx - self.robot.x, ty - self.robot.y) >= MIN_START_GOAL_DIST:
+                break
+        self.target = Target(tx, ty)
+
+        zone = 2 * (ROBOT_RADIUS + 40)
+        keep_clear = [pg.Rect(0, 0, zone, zone) for _ in range(2)]
+        keep_clear[0].center = (int(self.robot.x), int(self.robot.y))
+        keep_clear[1].center = (tx, ty)
+
+        self.obstacles: list[Obstacle] = []
+        for i, (w, h) in enumerate(OBSTACLE_SPECS):
+            for _ in range(50):
+                if i == 0:
+                    cx, cy = (self.robot.x + tx) / 2, (self.robot.y + ty) / 2
+                else:
+                    cx = rng.uniform(w / 2, WIDTH - w / 2)
+                    cy = rng.uniform(h / 2, HEIGHT - h / 2)
+                x, y = cx - w / 2, cy - h / 2
+                candidate = pg.Rect(round(x), round(y), w, h)
+                if not any(candidate.colliderect(z) for z in keep_clear):
+                    self.obstacles.append(Obstacle(x, y, w, h, (WIDTH, HEIGHT), rng))
+                    break
+
+        self.stats = RunStats()
+        self.frame = 0
+        self.last_plan_frame = 0
+        self.replan_requested = False
+        self.replan()
+
+    def replan(self) -> None:
+        rects = [o.predicted_rect(PREDICT_FRAMES) for o in self.obstacles]
+        path = plan_path((self.robot.x, self.robot.y), (self.target.x, self.target.y),
+                         rects, self.robot.radius)
+        self.stats.replans += 1
+        self.last_plan_frame = self.frame
+        if path:                                       # on failure keep the old path
+            self.robot.path = path
+            self.robot.path_idx = 1                    # index 0 is the robot's own position
+
+    # ---- per-frame update -----------------------------------------------
+    def handle_events(self) -> None:
+        for event in pg.event.get():
+            if event.type == pg.QUIT:
+                self.running = False
+            elif event.type == pg.KEYDOWN:
+                if event.key == pg.K_ESCAPE:
+                    self.running = False
+                elif event.key == pg.K_r:
+                    self.replan()
+                elif event.key == pg.K_a:
+                    self.autopilot = not self.autopilot
+                elif event.key == pg.K_n:
+                    self.new_scenario()
+                elif event.key == pg.K_d:
+                    self.show_debug = not self.show_debug
+
+    def update(self) -> None:
+        self.frame += 1
+        self.stats.frames += 1
+        for obs in self.obstacles:
+            obs.move()
+        rects = [o.rect for o in self.obstacles]
+
+        if self.autopilot:
+            since = self.frame - self.last_plan_frame
+            if since >= REPLAN_INTERVAL or (self.replan_requested and since >= REPLAN_MIN_GAP):
+                self.replan()
+                self.replan_requested = False
+            if self.robot.avoid_step(rects):
+                self.replan_requested = True
+            else:
+                self.robot.follow_path_step()
+        else:
+            self._manual_control()
+
+        self._resolve_collisions(rects)
+        self._check_run_end()
+
+    def _manual_control(self) -> None:
+        keys = pg.key.get_pressed()
+        if keys[pg.K_UP]:
+            self.robot.move(1.0)
+        if keys[pg.K_DOWN]:
+            self.robot.move(-1.0)
+        if keys[pg.K_LEFT]:
+            self.robot.rotate(-MANUAL_TURN_RATE)
+        if keys[pg.K_RIGHT]:
+            self.robot.rotate(MANUAL_TURN_RATE)
+
+    def _resolve_collisions(self, rects: list[pg.Rect]) -> None:
+        """Push the robot out of any obstacle it overlaps (position correction, heading untouched)."""
+        robot = self.robot
+        touched = False
+        for rect in rects:
+            if not circle_rect_collision(robot.x, robot.y, robot.radius, rect):
+                continue
+            touched = True
+            qx, qy = closest_point_on_rect(robot.x, robot.y, rect)
+            dx, dy = robot.x - qx, robot.y - qy
+            dist = math.hypot(dx, dy)
+            if dist > 1e-6:
+                penetration = robot.radius - dist + 0.01
+                robot.x += dx / dist * penetration
+                robot.y += dy / dist * penetration
+            else:                                      # centre inside rect: exit via nearest edge
+                gap, nx, ny = min((robot.x - rect.left, -1, 0), (rect.right - robot.x, 1, 0),
+                                  (robot.y - rect.top, 0, -1), (rect.bottom - robot.y, 0, 1))
+                robot.x += nx * (gap + robot.radius + 0.01)
+                robot.y += ny * (gap + robot.radius + 0.01)
+        robot.x = min(max(robot.x, robot.radius), WIDTH - robot.radius)
+        robot.y = min(max(robot.y, robot.radius), HEIGHT - robot.radius)
+        if touched:
+            self.stats.contact_frames += 1
+            self.replan_requested = True
+
+    def _check_run_end(self) -> None:
+        reached = math.hypot(self.robot.x - self.target.x,
+                             self.robot.y - self.target.y) <= self.robot.radius
+        if not reached and self.stats.frames < MAX_FRAMES_PER_RUN:
+            return
+        self.stats.reached = reached
+        self.history.append(self.stats)
+        s = self.stats
+        print(f"Run {len(self.history)}/{self.max_runs}: "
+              f"{'target reached' if reached else 'TIMEOUT'} | {s.frames} frames | "
+              f"{s.replans} replans | {s.contact_frames} contact frames")
+        if len(self.history) >= self.max_runs:
+            self.running = False
+        else:
+            self.autopilot = True
+            self.new_scenario()
+
+    # ---- rendering --------------------------------------------------------
+    def draw(self) -> None:
+        self.screen.fill((255, 255, 255))
+        for x, y in self.robot.path[self.robot.path_idx:]:
+            pg.draw.circle(self.screen, (0, 150, 150), (int(x), int(y)), 4)
+        if self.show_debug:
+            for obs in self.obstacles:
+                pg.draw.rect(self.screen, (255, 150, 150), obs.predicted_rect(PREDICT_FRAMES), 1)
+        self.robot.draw(self.screen)
+        self.target.draw(self.screen)
+        for obs in self.obstacles:
+            obs.draw(self.screen)
+        hud = (f"{'AUTO' if self.autopilot else 'MANUAL'} | run {len(self.history) + 1}/{self.max_runs} | "
+               f"replans {self.stats.replans} | [R] replan  [A] auto/manual  [N] new map  [D] debug")
+        self.screen.blit(self.font.render(hud, True, (60, 60, 60)), (8, 6))
+        pg.display.flip()
+
+    def print_summary(self) -> None:
+        if not self.history:
+            return
+        ok = [s for s in self.history if s.reached]
+        print(f"\nSummary: {len(ok)}/{len(self.history)} runs reached the target")
+        if ok:
+            print(f"  mean time to goal: {sum(s.frames for s in ok) / len(ok) / FPS:.1f}s simulated | "
+                  f"mean replans: {sum(s.replans for s in ok) / len(ok):.1f}")
+
+    def run(self) -> None:
+        while self.running:
+            self.handle_events()
+            self.update()
+            if not self.headless:
+                self.draw()
+                self.clock.tick(FPS)
+        self.print_summary()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="A* robot navigation simulator")
+    parser.add_argument("--runs", type=int, default=4, help="number of random scenarios to run")
+    parser.add_argument("--seed", type=int, default=None, help="RNG seed for reproducible scenarios")
+    parser.add_argument("--headless", action="store_true",
+                        help="no window, run as fast as possible (for testing/benchmarking)")
+    args = parser.parse_args()
+    if args.headless:
+        os.environ["SDL_VIDEODRIVER"] = "dummy"
+    pg.init()
+    try:
+        Simulation(args.runs, args.seed, args.headless).run()
+    finally:
+        pg.quit()
+
+
+if __name__ == "__main__":
+    main()
